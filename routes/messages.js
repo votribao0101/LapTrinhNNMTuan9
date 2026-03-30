@@ -3,7 +3,6 @@ var router = express.Router();
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const mongoose = require('mongoose');
 let modelMessage = require('../schemas/messages');
 let modelUser = require('../schemas/users');
 let { checkLogin } = require('../utils/authHandler.js.js');
@@ -24,15 +23,15 @@ const storage = multer.diskStorage({
 
 const upload = multer({ storage: storage });
 
-/* GET messages by userID - lấy toàn bộ message from: user hiện tại, to: userID và from: userID và to: user hiện tại */
+/* 1. GET /api/v1/messages/:userID - Lấy tất cả tin nhắn giữa 2 user */
 router.get('/:userID', checkLogin, async function (req, res, next) {
   try {
-    let currentUserId = req.userId; // Lấy từ token (đã login)
-    let targetUserId = req.params.userID; // User khác
+    let currentUserId = req.userId; // User hiện tại (từ token)
+    let targetUserId = req.params.userID; // User khác (từ URL)
 
     console.log(`📨 Getting messages between ${currentUserId} and ${targetUserId}`);
 
-    // Lấy tất cả tin nhắn giữa 2 users
+    // Tìm tất cả tin nhắn giữa 2 user
     let messages = await modelMessage.find({
       $or: [
         { from: currentUserId, to: targetUserId },
@@ -42,19 +41,16 @@ router.get('/:userID', checkLogin, async function (req, res, next) {
     })
     .populate('from', 'username email')
     .populate('to', 'username email')
-    .sort({ createdAt: 1 }); // Sắp xếp theo thời gian tăng dần
+    .sort({ createdAt: 1 });
 
     res.json({
       success: true,
       count: messages.length,
-      data: messages,
-      conversation: {
-        currentUser: currentUserId,
-        targetUser: targetUserId
-      }
+      data: messages
     });
 
   } catch (error) {
+    console.error('❌ Error:', error.message);
     res.status(500).json({
       success: false,
       message: "Error fetching messages",
@@ -63,57 +59,52 @@ router.get('/:userID', checkLogin, async function (req, res, next) {
   }
 });
 
-/* POST send message */
+/* 2. POST /api/v1/messages - Gửi tin nhắn (text hoặc file) */
 router.post('/', checkLogin, upload.single('file'), async function (req, res, next) {
   try {
-    // Lấy from từ token (user đã login)
-    let from = req.userId;
+    let from = req.userId; // User gửi (từ token)
     let { to, type, text } = req.body;
 
-    console.log('📨 Received message request:');
-    console.log('from (from token):', from);
+    console.log('📨 Sending message:');
+    console.log('from:', from);
     console.log('to:', to);
     console.log('type:', type);
-    console.log('text:', text);
-    console.log('file:', req.file);
 
-    // Validate required fields
+    // Kiểm tra required fields
     if (!to || !type) {
-      console.log('❌ Missing fields');
       return res.status(400).json({
         success: false,
-        message: "Missing required fields: to, type",
-        received: { from, to, type }
+        message: "Missing required fields: to, type"
       });
     }
 
-    // Validate users exist
-    const fromUser = await modelUser.findById(from);
+    // Kiểm tra user nhận có tồn tại không
     const toUser = await modelUser.findById(to);
-
-    if (!fromUser || !toUser) {
+    if (!toUser) {
       return res.status(404).json({
         success: false,
-        message: "From user or To user not found"
+        message: "User nhận không tồn tại"
       });
     }
 
     let messageContent = { type };
 
+    // Nếu gửi text
     if (type === 'text') {
       if (!text) {
         return res.status(400).json({
           success: false,
-          message: "Text content is required for text messages"
+          message: "Text content is required"
         });
       }
       messageContent.text = text;
     } 
+    // Nếu gửi file
     else if (type === 'file') {
       if (!req.file) {
         return res.status(400).json({
           success: false,
-          message: "File is required for file messages"
+          message: "File is required"
         });
       }
       messageContent.filePath = req.file.path;
@@ -121,11 +112,11 @@ router.post('/', checkLogin, upload.single('file'), async function (req, res, ne
     else {
       return res.status(400).json({
         success: false,
-        message: "Invalid message type. Must be 'text' or 'file'"
+        message: "Type phải là 'text' hoặc 'file'"
       });
     }
 
-    // Create new message
+    // Tạo tin nhắn mới
     let newMessage = new modelMessage({
       from: from,
       to: to,
@@ -133,23 +124,24 @@ router.post('/', checkLogin, upload.single('file'), async function (req, res, ne
     });
 
     await newMessage.save();
-
-    // Populate user info for response
     await newMessage.populate('from', 'username email');
     await newMessage.populate('to', 'username email');
 
+    console.log('✅ Message sent successfully');
+
     res.json({
       success: true,
-      message: "Message sent successfully",
+      message: "Gửi tin nhắn thành công",
       data: newMessage
     });
 
   } catch (error) {
-    // Clean up uploaded file on error
+    // Xóa file nếu có lỗi
     if (req.file && fs.existsSync(req.file.path)) {
       fs.unlinkSync(req.file.path);
     }
 
+    console.error('❌ Error:', error.message);
     res.status(500).json({
       success: false,
       message: "Error sending message",
@@ -158,106 +150,57 @@ router.post('/', checkLogin, upload.single('file'), async function (req, res, ne
   }
 });
 
-/* GET messages of current user - lấy message cuối cùng của mỗi user mà user hiện tại nhận tin hoặc user khác nhận cho user hiện tại */
+/* 3. GET /api/v1/messages - Lấy danh sách conversations (tin nhắn cuối cùng với mỗi user) */
 router.get('/', checkLogin, async function (req, res, next) {
   try {
-    let currentUserId = req.userId; // Lấy từ token (đã login)
+    let currentUserId = req.userId; // User hiện tại (từ token)
 
     console.log(`📨 Getting conversations for user ${currentUserId}`);
 
-    // Aggregate để lấy tin nhắn cuối cùng với mỗi user
-    let conversations = await modelMessage.aggregate([
-      // Match messages involving current user
-      {
-        $match: {
-          $or: [
-            { from: new mongoose.Types.ObjectId(currentUserId) },
-            { to: new mongoose.Types.ObjectId(currentUserId) }
-          ],
-          isDeleted: false
-        }
-      },
-      // Add field to identify the other user
-      {
-        $addFields: {
+    // Tìm tất cả tin nhắn của user hiện tại
+    let allMessages = await modelMessage.find({
+      $or: [
+        { from: currentUserId },
+        { to: currentUserId }
+      ],
+      isDeleted: false
+    })
+    .populate('from', 'username email')
+    .populate('to', 'username email')
+    .sort({ createdAt: -1 });
+
+    // Nhóm tin nhắn theo user khác
+    let conversations = {};
+
+    for (let msg of allMessages) {
+      // Xác định user khác
+      let otherUserId = msg.from._id.toString() === currentUserId ? msg.to._id : msg.from._id;
+      let otherUser = msg.from._id.toString() === currentUserId ? msg.to : msg.from;
+
+      // Nếu chưa có conversation với user này, thêm vào
+      if (!conversations[otherUserId]) {
+        conversations[otherUserId] = {
           otherUser: {
-            $cond: {
-              if: { $eq: ["$from", new mongoose.Types.ObjectId(currentUserId)] },
-              then: "$to",
-              else: "$from"
-            }
-          }
-        }
-      },
-      // Sort by creation time descending
-      { $sort: { createdAt: -1 } },
-      // Group by other user and get the latest message
-      {
-        $group: {
-          _id: "$otherUser",
-          lastMessage: { $first: "$$ROOT" }
-        }
-      },
-      // Lookup user information
-      {
-        $lookup: {
-          from: "users",
-          localField: "_id",
-          foreignField: "_id",
-          as: "userInfo"
-        }
-      },
-      {
-        $lookup: {
-          from: "users",
-          localField: "lastMessage.from",
-          foreignField: "_id",
-          as: "lastMessage.fromUser"
-        }
-      },
-      {
-        $lookup: {
-          from: "users",
-          localField: "lastMessage.to",
-          foreignField: "_id",
-          as: "lastMessage.toUser"
-        }
-      },
-      // Project final structure
-      {
-        $project: {
-          otherUser: {
-            _id: { $arrayElemAt: ["$userInfo._id", 0] },
-            username: { $arrayElemAt: ["$userInfo.username", 0] },
-            email: { $arrayElemAt: ["$userInfo.email", 0] }
+            _id: otherUser._id,
+            username: otherUser.username,
+            email: otherUser.email
           },
-          lastMessage: {
-            _id: "$lastMessage._id",
-            messageContent: "$lastMessage.messageContent",
-            createdAt: "$lastMessage.createdAt",
-            from: {
-              _id: { $arrayElemAt: ["$lastMessage.fromUser._id", 0] },
-              username: { $arrayElemAt: ["$lastMessage.fromUser.username", 0] }
-            },
-            to: {
-              _id: { $arrayElemAt: ["$lastMessage.toUser._id", 0] },
-              username: { $arrayElemAt: ["$lastMessage.toUser.username", 0] }
-            }
-          }
-        }
-      },
-      // Sort by last message time
-      { $sort: { "lastMessage.createdAt": -1 } }
-    ]);
+          lastMessage: msg
+        };
+      }
+    }
+
+    // Convert object thành array
+    let conversationList = Object.values(conversations);
 
     res.json({
       success: true,
-      count: conversations.length,
-      data: conversations,
-      currentUser: currentUserId
+      count: conversationList.length,
+      data: conversationList
     });
 
   } catch (error) {
+    console.error('❌ Error:', error.message);
     res.status(500).json({
       success: false,
       message: "Error fetching conversations",
